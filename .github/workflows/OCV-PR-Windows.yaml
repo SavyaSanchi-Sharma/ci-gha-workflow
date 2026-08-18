@@ -50,22 +50,9 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        arch: [ x86, x64, arm64 ]
+        arch: [ arm64 ]
         config: [ base ]
         include:
-          - arch: arm64
-            config: base
-            runner: opencv-cn-win
-            vs: 'Visual Studio 16 2019'
-            cmake_arch: Win32
-          - arch: x64
-            config: base
-            runner: opencv-cn-win
-            vs: 'Visual Studio 16 2019'
-            cmake_arch: x64
-          # arm64 is the only GitHub-hosted build job here. The image is not under
-          # OpenCV's control, which is the source of most of the arm64-specific
-          # handling below. See the "Sanitize runner environment" step.
           - arch: arm64
             config: base
             runner: windows-11-arm
@@ -83,44 +70,37 @@ jobs:
         -DBUILD_EXAMPLES=ON
         -DOPENCV_ENABLE_NONFREE=ON
         -DCMAKE_BUILD_TYPE=Release
+        ${{ matrix.arch == 'arm64' && '-DWITH_OPENMP=ON' || '' }}
+        ${{ matrix.arch == 'arm64' && '-DCMAKE_ASM_COMPILER=CMAKE_ASM_COMPILER-NOTFOUND' || '' }}
         ${{ matrix.no_opencl && '-DWITH_OPENCL=OFF' || '' }}
-        ${{ matrix.arch == 'arm64' && '-DCMAKE_BUILD_TYPE=Release -DWITH_VULKAN=OFF -DBUILD_opencv_vulkan=OFF -DOPENCV_DNN_VULKAN=OFF -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=ON -DWITH_OPENMP=ON' || '' }}
-        ${{ (matrix.arch == 'x86' || matrix.arch == 'arm64') && '-DBUILD_opencv_python3=OFF' || '' }}
       MAIN_BUILD_DIR: "${{ (github.event.repository.name != 'opencv_contrib') && 'build' || 'build-contrib' }}"
-      # windows-11-arm is a 4 vCPU runner (NUMBER_OF_PROCESSORS=4). Requesting 8
-      # threads there oversubscribes 2:1, which the default Windows ms-concurrency
-      # (PPL) backend does not survive -- see the notes on the arm64 job below.
-      OPENCV_FOR_THREADS_NUM: ${{ matrix.arch == 'arm64' && 4 || 8 }}
-      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.arch == 'arm64' && 4 || 8 }}
+      OPENCV_FOR_THREADS_NUM: 8
+      CMAKE_BUILD_PARALLEL_LEVEL: 8
 
     # ==========
 
     steps:
 
-    # The GitHub windows-11-arm image adds C:\mingw64\bin to the *machine* PATH
-    # (actions/runner-images :: images/windows/scripts/build/Install-Mingw64.ps1,
-    # "Add-MachinePathItem C:\mingw64\bin"), and the MinGW it installs is x86_64,
-    # which runs under x64 emulation on ARM64. CMake's ASM probe therefore
-    # succeeds against C:/mingw64/bin/cc.exe, identifies the ASM compiler as GNU,
-    # and OpenCV starts emitting GNU-style link flags into an MSVC build:
-    #
-    #   LINK : warning LNK4044: unrecognized option '/lpthread'; ignored   (x270)
-    #   LINK : warning LNK4044: unrecognized option '/ld3d9';    ignored
-    #   -> LNK2019 unresolved Direct3DCreate9 / D3D11CreateDeviceAndSwapChain
-    #   -> LNK1120, build fails (5.x only; 4.x has no ASM block to trip on)
-    #
-    # Removing the directory from PATH fixes the cause. The alternative seen in
-    # the wild, -DCMAKE_ASM_COMPILER=CMAKE_ASM_COMPILER-NOTFOUND, only defeats the
-    # probe and leaves the same trap for the next thing that looks for a compiler.
-    - name: Sanitize runner environment
+    - name: Python dependencies
       if: ${{ matrix.arch == 'arm64' }}
       shell: pwsh
       run: |
-        $clean = ($env:PATH -split ';' | Where-Object { $_ -and $_ -notmatch 'mingw' }) -join ';'
-        "PATH=$clean" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        Write-Host "vCPUs             : $env:NUMBER_OF_PROCESSORS"
-        Write-Host "OPENCV threads    : $env:OPENCV_FOR_THREADS_NUM"
-        Write-Host "removed from PATH : $(($env:PATH -split ';' | Where-Object { $_ -match 'mingw' }) -join ', ')"
+        python -m pip install --upgrade pip
+        python -m pip install numpy
+        $inc = python -c "import sysconfig; print(sysconfig.get_paths()['include'])"
+        $lib = python -c "import sys,glob,os; c=glob.glob(os.path.join(sys.base_prefix,'libs','python3*.lib')); print(c[0] if c else '')"
+        Write-Host "interpreter : $(python -c 'import sys,platform; print(sys.version.split()[0], platform.machine())')"
+        Write-Host "numpy       : $(python -c 'import numpy; print(numpy.__version__)')"
+        Write-Host "include     : $inc"
+        Write-Host "library     : $lib"
+        if ((Test-Path (Join-Path $inc 'Python.h')) -and $lib) {
+          "PYTHON3_INCLUDE_DIR=$inc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PYTHON3_LIBRARY=$lib"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        } else {
+          Write-Host "::warning::Python development files not found; opencv_python3 will not be built"
+          $root = python -c "import sys; print(sys.base_prefix)"
+          Get-ChildItem $root, (Join-Path $root 'libs') -ErrorAction SilentlyContinue | Out-String | Write-Host
+        }
 
     - name: Propagate environment
       run: |
@@ -192,7 +172,7 @@ jobs:
         OPENCV_TEST_DATA_PATH: '${{ github.workspace }}/opencv_extra/testdata'
         OPENCV_TEST_REQUIRE_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
         OPENCV_TEST_CHECK_OPTIONAL_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
-        PYTHONPATH: '${{ github.workspace }}/${{ env.MAIN_BUILD_DIR }}/python_loader:$PYTHONPATH'
+        PYTHONPATH: '${{ github.workspace }}/${{ env.MAIN_BUILD_DIR }}/python_loader;${{ env.PYTHONPATH }}'
         OPENCV_OPENCL_RUNTIME: 'disabled'
       with:
         workdir: '${{ github.workspace }}'
@@ -200,7 +180,7 @@ jobs:
         logdir: '${{ github.workspace }}'
         plan: "test-plan-win-${{ matrix.branch }}.json"
         suite: "[ ${{ (github.event.repository.name == 'opencv_contrib') && '''contrib'''  || '''main''' }} ]"
-        enable_python: "false"
+        enable_python: "true"
         enable_java: "false"
         filter: "[ 'windows-common' ]"
         suffix: '${{ matrix.arch }}_${{ matrix.branch }}'
