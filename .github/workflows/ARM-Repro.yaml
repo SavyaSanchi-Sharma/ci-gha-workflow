@@ -1,0 +1,101 @@
+name: ARM Repro
+
+on:
+  workflow_dispatch:
+    inputs:
+      opencv_branch:
+        description: "OpenCV branch"
+        default: "4.x"
+        type: string
+      threads:
+        description: "Thread counts to sweep (space separated)"
+        default: "1 2 3 4"
+        type: string
+      filter:
+        description: "gtest filter"
+        default: "*ColorYUV*:*RemapRelative*"
+        type: string
+      cmake_extra:
+        description: "Extra CMake flags (e.g. -DWITH_OPENMP=ON)"
+        default: ""
+        type: string
+
+jobs:
+  repro:
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    steps:
+
+      - name: Machine
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Format-List Name, NumberOfCores, NumberOfLogicalProcessors
+          (Get-Item C:\Windows\System32\concrt140.dll).VersionInfo.FileVersion
+
+      - name: Checkout OpenCV
+        uses: actions/checkout@v4
+        with:
+          repository: opencv/opencv
+          ref: ${{ inputs.opencv_branch }}
+          path: opencv
+          fetch-depth: 1
+
+      - name: Configure (core + imgproc only)
+        shell: pwsh
+        run: |
+          cmake -S opencv -B build -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_ASM_COMPILER=CMAKE_ASM_COMPILER-NOTFOUND `
+            -DBUILD_LIST=imgproc `
+            -DBUILD_TESTS=ON `
+            -DBUILD_PERF_TESTS=OFF `
+            -DBUILD_EXAMPLES=OFF `
+            -DBUILD_opencv_apps=OFF `
+            -DBUILD_DOCS=OFF `
+            -DWITH_OPENCL=OFF -DWITH_IPP=OFF -DWITH_PROTOBUF=OFF `
+            -DWITH_FFMPEG=OFF -DWITH_MSMF=OFF -DWITH_DSHOW=OFF `
+            -DBUILD_opencv_python3=OFF -DBUILD_opencv_python_bindings_generator=OFF `
+            ${{ inputs.cmake_extra }}
+          Select-String -Path build\CMakeCache.txt -Pattern 'CMAKE_ASM_COMPILER:' | Write-Host
+
+      - name: Build only opencv_test_imgproc
+        shell: pwsh
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 8
+        run: cmake --build build --config Release --target opencv_test_imgproc
+
+      - name: Confirm parallel backend
+        shell: pwsh
+        run: Select-String -Path build\CMakeVars.txt, build\CMakeCache.txt -Pattern 'PARALLEL|OPENMP|TBB' -ErrorAction SilentlyContinue | Select-Object -First 10 | Write-Host
+
+      - name: Sweep
+        shell: pwsh
+        env:
+          OPENCV_TEST_REQUIRE_DATA: '0'
+          OPENCV_TEST_CHECK_OPTIONAL_DATA: '0'
+          OPENCV_OPENCL_RUNTIME: 'disabled'
+        run: |
+          $exe = "build\bin\Release\opencv_test_imgproc.exe"
+          $summary = @()
+          foreach ($n in ("${{ inputs.threads }}" -split '\s+')) {
+            $env:OPENCV_FOR_THREADS_NUM = $n
+            $log = "repro-t$n.log"
+            Write-Host "::group::threads=$n"
+            & $exe "--gtest_filter=${{ inputs.filter }}" *>&1 | Tee-Object -FilePath $log
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            $failed = (Select-String -Path $log -Pattern '^\[  FAILED  \] .*\.' -ErrorAction SilentlyContinue).Count
+            $ran    = (Select-String -Path $log -Pattern '^\[ RUN      \]' -ErrorAction SilentlyContinue).Count
+            $summary += [pscustomobject]@{ threads = $n; ran = $ran; failed = $failed; exit = $code }
+          }
+          Write-Host ""
+          Write-Host "==================== SUMMARY ===================="
+          $summary | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-logs
+          path: repro-*.log
+          if-no-files-found: warn
