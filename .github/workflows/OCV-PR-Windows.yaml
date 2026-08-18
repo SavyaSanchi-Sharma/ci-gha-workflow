@@ -87,19 +87,28 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install numpy
-        $inc = python -c "import sysconfig; print(sysconfig.get_paths()['include'])"
-        $lib = python -c "import sys,glob,os; c=glob.glob(os.path.join(sys.base_prefix,'libs','python3*.lib')); print(c[0] if c else '')"
+
+        $inc    = python -c "import sysconfig; print(sysconfig.get_paths()['include'])"
+        $libdir = python -c "import sys,os; print(os.path.join(sys.base_prefix,'libs'))"
+        $libname= python -c "import sys; print('python%d%d.lib' % sys.version_info[:2])"
+        $lib    = Join-Path $libdir $libname
+
         Write-Host "interpreter : $(python -c 'import sys,platform; print(sys.version.split()[0], platform.machine())')"
         Write-Host "numpy       : $(python -c 'import numpy; print(numpy.__version__)')"
         Write-Host "include     : $inc"
+        Write-Host "libdir      : $libdir"
         Write-Host "library     : $lib"
-        if ((Test-Path (Join-Path $inc 'Python.h')) -and $lib) {
+        Get-ChildItem $libdir -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name | Out-String | Write-Host
+
+        if ((Test-Path (Join-Path $inc 'Python.h')) -and (Test-Path $lib)) {
           "PYTHON3_INCLUDE_DIR=$inc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "PYTHON3_LIBRARY=$lib"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # pyconfig.h does #pragma comment(lib,"pythonXY.lib"), which the linker
+          # resolves via LIBPATH, not via the library CMake passes explicitly.
+          "LIB=$env:LIB;$libdir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         } else {
-          Write-Host "::warning::Python development files not found; opencv_python3 will not be built"
-          $root = python -c "import sys; print(sys.base_prefix)"
-          Get-ChildItem $root, (Join-Path $root 'libs') -ErrorAction SilentlyContinue | Out-String | Write-Host
+          Write-Host "::error::Python development files missing (include=$inc lib=$lib)"
+          exit 1
         }
 
     - name: Propagate environment
