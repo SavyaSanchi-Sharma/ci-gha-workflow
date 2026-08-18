@@ -12,6 +12,7 @@ on:
       - 'run-tests/*'
       - 'scripts/runner.py'
       - 'scripts/test-plan.json'
+  workflow_dispatch:
   workflow_call:
     inputs:
       workflow_branch:
@@ -79,6 +80,20 @@ jobs:
     # ==========
 
     steps:
+
+    - name: Runtime fingerprint
+      if: ${{ matrix.arch == 'arm64' }}
+      shell: pwsh
+      run: |
+        Get-ChildItem C:\Windows\System32\concrt140.dll,
+                      C:\Windows\System32\vcruntime140.dll,
+                      C:\Windows\System32\msvcp140.dll -ErrorAction SilentlyContinue |
+          ForEach-Object { "{0,-18} {1,-16} {2}" -f $_.Name, $_.VersionInfo.FileVersion, $_.FullName }
+        Get-CimInstance Win32_Processor |
+          Format-List Name, Description, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed
+        "logical processors : $([Environment]::ProcessorCount)"
+        "RAM (GB)           : $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,1))"
+        "OS                 : $([Environment]::OSVersion.Version)"
 
     - name: Propagate environment
       run: |
